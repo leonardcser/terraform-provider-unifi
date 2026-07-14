@@ -70,6 +70,7 @@ resource "unifi_device" "us_24_poe" {
 - `bandsteering_mode` (String) Band steering mode; valid values are `off`, `equal`, and `prefer_5g`.
 - `config_network` (Attributes) Network configuration for the device. (see [below for nested schema](#nestedatt--config_network))
 - `disabled` (Boolean) Specifies whether this device should be disabled.
+- `ether_lighting` (Attributes) Per-port Etherlighting behavior for supported switches. (see [below for nested schema](#nestedatt--ether_lighting))
 - `flowctrl_enabled` (Boolean) Enable flow control.
 - `forget_on_destroy` (Boolean) Specifies whether this resource should tell the controller to forget the device on destroy.
 - `jumboframe_enabled` (Boolean) Enable jumbo frames.
@@ -136,6 +137,17 @@ Optional:
 - `cycle_enabled` (Boolean) Enable power cycle.
 - `name` (String) Outlet name.
 - `relay_state` (Boolean) Relay state (on/off).
+
+
+<a id="nestedatt--ether_lighting"></a>
+### Nested Schema for `ether_lighting`
+
+Optional:
+
+- `behavior` (String) LED animation: `steady` or `breath`.
+- `brightness` (Number) Etherlighting brightness from 1 to 100.
+- `led_mode` (String) LED mode: `standard` or `etherlighting`.
+- `mode` (String) Color ports by `network` or link `speed`.
 
 
 <a id="nestedblock--port_override"></a>

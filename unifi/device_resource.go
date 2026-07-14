@@ -95,6 +95,7 @@ type deviceResourceModel struct {
 	LedOverride                types.String `tfsdk:"led_override"`
 	LedOverrideColor           types.String `tfsdk:"led_override_color"`
 	LedOverrideColorBrightness types.Int64  `tfsdk:"led_override_color_brightness"`
+	EtherLighting              types.Object `tfsdk:"ether_lighting"`
 
 	// Device features
 	BandsteeringMode  types.String `tfsdk:"bandsteering_mode"`
@@ -239,6 +240,20 @@ type outletOverrideModel struct {
 	Name         types.String `tfsdk:"name"`
 	RelayState   types.Bool   `tfsdk:"relay_state"`
 	CycleEnabled types.Bool   `tfsdk:"cycle_enabled"`
+}
+
+type deviceEtherLightingModel struct {
+	Mode       types.String `tfsdk:"mode"`
+	LedMode    types.String `tfsdk:"led_mode"`
+	Behavior   types.String `tfsdk:"behavior"`
+	Brightness types.Int64  `tfsdk:"brightness"`
+}
+
+var deviceEtherLightingAttrTypes = map[string]attr.Type{
+	"mode":       types.StringType,
+	"led_mode":   types.StringType,
+	"behavior":   types.StringType,
+	"brightness": types.Int64Type,
 }
 
 func (r *deviceResource) Metadata(
@@ -412,6 +427,36 @@ func (r *deviceResource) Schema(
 				Computed:    true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
+				},
+			},
+			"ether_lighting": schema.SingleNestedAttribute{
+				Description: "Per-port Etherlighting behavior for supported switches.",
+				Optional:    true,
+				Attributes: map[string]schema.Attribute{
+					"mode": schema.StringAttribute{
+						Description: "Color ports by network or link speed.",
+						Optional:    true,
+						Computed:    true,
+						Validators:  []validator.String{stringvalidator.OneOf("network", "speed")},
+					},
+					"led_mode": schema.StringAttribute{
+						Description: "Use standard LEDs or Etherlighting.",
+						Optional:    true,
+						Computed:    true,
+						Validators:  []validator.String{stringvalidator.OneOf("standard", "etherlighting")},
+					},
+					"behavior": schema.StringAttribute{
+						Description: "Use steady or breathing LEDs.",
+						Optional:    true,
+						Computed:    true,
+						Validators:  []validator.String{stringvalidator.OneOf("steady", "breath")},
+					},
+					"brightness": schema.Int64Attribute{
+						Description: "Etherlighting brightness from 1 to 100.",
+						Optional:    true,
+						Computed:    true,
+						Validators:  []validator.Int64{int64validator.Between(1, 100)},
+					},
 				},
 			},
 
@@ -1385,6 +1430,7 @@ func (r *deviceResource) Update(
 	plannedLedOverride := plan.LedOverride
 	plannedLedOverrideColor := plan.LedOverrideColor
 	plannedLedOverrideColorBrightness := plan.LedOverrideColorBrightness
+	plannedEtherLighting := plan.EtherLighting
 
 	// Update the device with only user-configured fields
 	diags = r.updateDevice(ctx, &plan)
@@ -1420,6 +1466,9 @@ func (r *deviceResource) Update(
 	if !plannedLedOverrideColorBrightness.IsNull() &&
 		!plannedLedOverrideColorBrightness.IsUnknown() {
 		plan.LedOverrideColorBrightness = plannedLedOverrideColorBrightness
+	}
+	if !plannedEtherLighting.IsNull() && !plannedEtherLighting.IsUnknown() {
+		plan.EtherLighting = plannedEtherLighting
 	}
 	// allow_adoption / forget_on_destroy were resolved before the update and are
 	// not touched by setResourceData; ensure a concrete value (default true)
@@ -1630,6 +1679,7 @@ func buildMinimalUpdateDevice(
 		LedOverride:                deviceReq.LedOverride,
 		LedOverrideColor:           deviceReq.LedOverrideColor,
 		LedOverrideColorBrightness: deviceReq.LedOverrideColorBrightness,
+		EtherLighting:              deviceReq.EtherLighting,
 		SwitchVLANEnabled:          deviceReq.SwitchVLANEnabled,
 		MeshStaVapEnabled:          deviceReq.MeshStaVapEnabled,
 		RadioTable:                 deviceReq.RadioTable,
@@ -1637,6 +1687,22 @@ func buildMinimalUpdateDevice(
 	if currentDevice != nil {
 		minimalDevice.State = currentDevice.State
 		minimalDevice.Adopted = currentDevice.Adopted
+		if deviceReq.EtherLighting != nil && currentDevice.EtherLighting != nil {
+			merged := *currentDevice.EtherLighting
+			if deviceReq.EtherLighting.Mode != "" {
+				merged.Mode = deviceReq.EtherLighting.Mode
+			}
+			if deviceReq.EtherLighting.LedMode != "" {
+				merged.LedMode = deviceReq.EtherLighting.LedMode
+			}
+			if deviceReq.EtherLighting.Behavior != "" {
+				merged.Behavior = deviceReq.EtherLighting.Behavior
+			}
+			if deviceReq.EtherLighting.Brightness != nil {
+				merged.Brightness = deviceReq.EtherLighting.Brightness
+			}
+			minimalDevice.EtherLighting = &merged
+		}
 	}
 	return minimalDevice
 }
@@ -1688,11 +1754,18 @@ func (r *deviceResource) updateDevice(
 	// existing controller-side config — i.e. partial management of just the declared
 	// ports. With no override declared we leave the field untouched as before.
 	portOverrides := deviceReq.PortOverrides
-	if currentDevice != nil && len(deviceReq.PortOverrides) > 0 {
-		portOverrides = mergePortOverridesByIndex(
-			currentDevice.PortOverrides,
-			deviceReq.PortOverrides,
-		)
+	if currentDevice != nil {
+		if len(deviceReq.PortOverrides) > 0 {
+			portOverrides = mergePortOverridesByIndex(
+				currentDevice.PortOverrides,
+				deviceReq.PortOverrides,
+			)
+		} else {
+			portOverrides = currentDevice.PortOverrides
+		}
+		if len(deviceReq.RadioTable) > 0 {
+			deviceReq.RadioTable = mergeRadioTable(currentDevice.RadioTable, deviceReq.RadioTable)
+		}
 	}
 
 	minimalDevice := buildMinimalUpdateDevice(deviceReq, currentDevice, portOverrides)
@@ -1710,6 +1783,10 @@ func (r *deviceResource) updateDevice(
 			"Error Updating Device",
 			fmt.Sprintf("Could not update device: %s", err),
 		)
+		return diags
+	}
+	if currentDevice != nil && currentDevice.State != unifi.DeviceStateConnected {
+		r.setResourceData(ctx, &diags, device, model, site)
 		return diags
 	}
 
@@ -1733,6 +1810,50 @@ func (r *deviceResource) updateDevice(
 	// Update state from API response
 	r.setResourceData(ctx, &diags, device, model, site)
 	return diags
+}
+
+func mergeRadioTable(current, planned []unifi.DeviceRadioTable) []unifi.DeviceRadioTable {
+	byRadio := make(map[string]unifi.DeviceRadioTable, len(current))
+	for _, radio := range current {
+		byRadio[radio.Radio] = radio
+	}
+	merged := make([]unifi.DeviceRadioTable, 0, len(planned))
+	for _, plan := range planned {
+		radio := byRadio[plan.Radio]
+		radio.Radio = plan.Radio
+		if plan.Channel != "" {
+			radio.Channel = plan.Channel
+		}
+		if plan.Ht != nil && *plan.Ht != 0 {
+			radio.Ht = plan.Ht
+		}
+		if plan.TxPower != "" {
+			radio.TxPower = plan.TxPower
+		}
+		if plan.TxPowerMode != "" {
+			radio.TxPowerMode = plan.TxPowerMode
+		}
+		if plan.MinRssi != nil && *plan.MinRssi != 0 {
+			radio.MinRssi = plan.MinRssi
+		}
+		if plan.AntennaGain != nil && *plan.AntennaGain != 0 {
+			radio.AntennaGain = plan.AntennaGain
+		}
+		if plan.AntennaID != nil && *plan.AntennaID != 0 {
+			radio.AntennaID = plan.AntennaID
+		}
+		if plan.AssistedRoamingRssi != nil && *plan.AssistedRoamingRssi != 0 {
+			radio.AssistedRoamingRssi = plan.AssistedRoamingRssi
+		}
+		if plan.Maxsta != nil && *plan.Maxsta != 0 {
+			radio.Maxsta = plan.Maxsta
+		}
+		if plan.SensLevel != nil && *plan.SensLevel != 0 {
+			radio.SensLevel = plan.SensLevel
+		}
+		merged = append(merged, radio)
+	}
+	return merged
 }
 
 func (r *deviceResource) setResourceData(
@@ -1798,6 +1919,22 @@ func (r *deviceResource) setResourceData(
 		)
 	} else if model.LedOverrideColorBrightness.IsUnknown() {
 		model.LedOverrideColorBrightness = types.Int64Null()
+	}
+
+	if !model.EtherLighting.IsNull() && !model.EtherLighting.IsUnknown() && device.EtherLighting != nil {
+		etherLighting := deviceEtherLightingModel{
+			Mode:       util.StringValueOrNull(device.EtherLighting.Mode),
+			LedMode:    util.StringValueOrNull(device.EtherLighting.LedMode),
+			Behavior:   util.StringValueOrNull(device.EtherLighting.Behavior),
+			Brightness: types.Int64PointerValue(device.EtherLighting.Brightness),
+		}
+		value, valueDiags := types.ObjectValueFrom(ctx, deviceEtherLightingAttrTypes, etherLighting)
+		diags.Append(valueDiags...)
+		if !diags.HasError() {
+			model.EtherLighting = value
+		}
+	} else if model.EtherLighting.IsUnknown() {
+		model.EtherLighting = types.ObjectNull(deviceEtherLightingAttrTypes)
 	}
 
 	// Device features
@@ -1940,6 +2077,18 @@ func (r *deviceResource) modelToAPIDevice(
 	}
 	if !model.LedOverrideColorBrightness.IsNull() && !model.LedOverrideColorBrightness.IsUnknown() {
 		device.LedOverrideColorBrightness = model.LedOverrideColorBrightness.ValueInt64Pointer()
+	}
+	if !model.EtherLighting.IsNull() && !model.EtherLighting.IsUnknown() {
+		var etherLighting deviceEtherLightingModel
+		diags.Append(model.EtherLighting.As(ctx, &etherLighting, basetypes.ObjectAsOptions{})...)
+		if !diags.HasError() {
+			device.EtherLighting = &unifi.DeviceEtherLighting{
+				Mode:       etherLighting.Mode.ValueString(),
+				LedMode:    etherLighting.LedMode.ValueString(),
+				Behavior:   etherLighting.Behavior.ValueString(),
+				Brightness: int64Pointer(etherLighting.Brightness),
+			}
+		}
 	}
 
 	// Device features
