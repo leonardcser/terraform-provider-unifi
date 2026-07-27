@@ -309,6 +309,7 @@ func (p *unifiProvider) Resources(ctx context.Context) []func() resource.Resourc
 		NewSettingResource,
 		NewSettingEtherLightingResource,
 		NewSettingLocaleResource,
+		NewSettingWifiSpeedResource,
 		NewSiteFrameworkResource,
 		NewSiteToSiteVPNResource,
 		NewStaticRouteFrameworkResource,
