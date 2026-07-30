@@ -99,6 +99,10 @@ type firewallRuleResourceModel struct {
 	Timeouts            timeouts.Value     `tfsdk:"timeouts"`
 }
 
+type firewallRuleIdentityModel struct {
+	ID types.String `tfsdk:"id"`
+}
+
 func (r *firewallRuleResource) Metadata(
 	ctx context.Context,
 	req resource.MetadataRequest,
@@ -396,7 +400,8 @@ func (r *firewallRuleResource) Create(
 
 	r.firewallRuleToModel(ctx, createdFirewallRule, &data, site)
 
-	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), data.ID)...)
+	idModel := firewallRuleIdentityModel{ID: data.ID}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -428,6 +433,8 @@ func (r *firewallRuleResource) Read(
 	firewallRule, err := r.client.GetFirewallRule(ctx, site, data.ID.ValueString())
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
+			idModel := firewallRuleIdentityModel{ID: data.ID}
+			resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -440,7 +447,8 @@ func (r *firewallRuleResource) Read(
 
 	r.firewallRuleToModel(ctx, firewallRule, &data, site)
 
-	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), data.ID)...)
+	idModel := firewallRuleIdentityModel{ID: data.ID}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -493,7 +501,8 @@ func (r *firewallRuleResource) Update(
 
 	state.Timeouts = plan.Timeouts
 
-	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), state.ID)...)
+	idModel := firewallRuleIdentityModel{ID: state.ID}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
