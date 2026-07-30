@@ -1292,13 +1292,15 @@ func (r *deviceResource) Read(
 	ctx, cancel := context.WithTimeout(ctx, readTimeout)
 	defer cancel()
 
-	// Preserve plan-only flags and port_override before reading API state.
+	// Preserve configuration-sensitive values before reading API state.
 	// Port_override is a Set where ALL fields contribute to identity. The API
 	// returns all ports with all fields, but the user only configures a subset.
-	// Keeping the user's minimal set in state prevents phantom drift on every plan.
+	// Automatic radio settings are reported as their current concrete values, so
+	// retain their configured semantics instead of creating perpetual drift.
 	allowAdoption := state.AllowAdoption
 	forgetOnDestroy := state.ForgetOnDestroy
 	priorPortOverride := state.PortOverride
+	priorRadioTable := state.RadioTable
 
 	id := state.ID.ValueString()
 	mac := state.MAC.ValueString()
@@ -1367,6 +1369,16 @@ func (r *deviceResource) Read(
 		if !resp.Diagnostics.HasError() {
 			state.PortOverride = reconciled
 		}
+	}
+
+	reconciledRadios, radioDiags := reconcileAutomaticRadioSettings(
+		ctx,
+		priorRadioTable,
+		state.RadioTable,
+	)
+	resp.Diagnostics.Append(radioDiags...)
+	if !resp.Diagnostics.HasError() {
+		state.RadioTable = reconciledRadios
 	}
 
 	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), state.ID)...)
@@ -1453,8 +1465,9 @@ func (r *deviceResource) Update(
 		plan.ConfigNetwork = types.ObjectNull(configNetworkAttrTypes())
 	}
 
-	// Save planned port overrides for post-update restore
+	// Save configuration-sensitive values for post-update reconciliation.
 	plannedPortOverride := plan.PortOverride
+	plannedRadioTable := plan.RadioTable
 
 	// Save planned LED overrides too. The controller applies these to APs
 	// asynchronously, so the immediate post-update read can still report the old
@@ -1487,6 +1500,17 @@ func (r *deviceResource) Update(
 
 	// Restore port_override from plan (API returns all ports, plan has subset)
 	plan.PortOverride = plannedPortOverride
+
+	reconciledRadios, radioDiags := reconcileAutomaticRadioSettings(
+		ctx,
+		plannedRadioTable,
+		plan.RadioTable,
+	)
+	resp.Diagnostics.Append(radioDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	plan.RadioTable = reconciledRadios
 
 	// Re-assert the planned LED values when the user configured them, so an
 	// asynchronously-applied controller value doesn't trip the consistency
@@ -1898,6 +1922,63 @@ func isLookupFailure(err error) bool {
 	}
 	var notFound *unifi.NotFoundError
 	return !errors.As(err, &notFound)
+}
+
+func reconcileAutomaticRadioSettings(
+	ctx context.Context,
+	desired, actual types.List,
+) (types.List, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if desired.IsNull() || desired.IsUnknown() || actual.IsNull() || actual.IsUnknown() {
+		return actual, diags
+	}
+
+	var desiredRadios, actualRadios []radioTableModel
+	diags.Append(desired.ElementsAs(ctx, &desiredRadios, false)...)
+	diags.Append(actual.ElementsAs(ctx, &actualRadios, false)...)
+	if diags.HasError() {
+		return actual, diags
+	}
+
+	desiredByRadio := make(map[string]radioTableModel, len(desiredRadios))
+	for _, radio := range desiredRadios {
+		if !radio.Radio.IsNull() && !radio.Radio.IsUnknown() {
+			desiredByRadio[radio.Radio.ValueString()] = radio
+		}
+	}
+
+	elements := make([]attr.Value, 0, len(actualRadios))
+	for _, radio := range actualRadios {
+		desiredRadio, ok := desiredByRadio[radio.Radio.ValueString()]
+		if ok {
+			if !desiredRadio.Channel.IsNull() && !desiredRadio.Channel.IsUnknown() &&
+				desiredRadio.Channel.ValueString() == "auto" {
+				radio.Channel = desiredRadio.Channel
+			}
+			if !desiredRadio.TxPower.IsNull() && !desiredRadio.TxPower.IsUnknown() &&
+				desiredRadio.TxPower.ValueString() == "auto" {
+				radio.TxPower = desiredRadio.TxPower
+			}
+			if !desiredRadio.TxPowerMode.IsNull() && !desiredRadio.TxPowerMode.IsUnknown() &&
+				desiredRadio.TxPowerMode.ValueString() == "auto" {
+				radio.TxPowerMode = desiredRadio.TxPowerMode
+			}
+		}
+
+		value, valueDiags := types.ObjectValueFrom(ctx, radioTableAttrTypes(), radio)
+		diags.Append(valueDiags...)
+		elements = append(elements, value)
+	}
+	if diags.HasError() {
+		return actual, diags
+	}
+
+	value, valueDiags := types.ListValue(
+		types.ObjectType{AttrTypes: radioTableAttrTypes()},
+		elements,
+	)
+	diags.Append(valueDiags...)
+	return value, diags
 }
 
 func mergeRadioTable(current, planned []unifi.DeviceRadioTable) []unifi.DeviceRadioTable {
@@ -2416,11 +2497,15 @@ func (r *deviceResource) reconcilePortOverrides(
 			}
 		}
 		if !pm.PortProfileID.IsNull() {
-			if apiPO.PortProfileID == "" {
-				updated.PortProfileID = types.StringNull()
-			} else {
+			switch {
+			case apiPO.PortProfileID != "":
 				updated.PortProfileID = types.StringValue(apiPO.PortProfileID)
+			case apiPO.NATiveNetworkID == "":
+				updated.PortProfileID = types.StringNull()
 			}
+			// Gateway devices expand profiles into native/tagged network fields and
+			// omit portconf_id. The seeded value is preserved only when that expanded
+			// configuration is present; a genuinely empty response remains drift.
 		}
 
 		objVal, objDiags := types.ObjectValueFrom(ctx, updated.AttributeTypes(), updated)

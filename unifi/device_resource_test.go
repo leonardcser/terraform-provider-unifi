@@ -18,6 +18,64 @@ import (
 	"github.com/ubiquiti-community/go-unifi/unifi"
 )
 
+func TestReconcileAutomaticRadioSettings(t *testing.T) {
+	ctx := context.Background()
+	resource := &deviceResource{}
+
+	makeRadios := func(radios []unifi.DeviceRadioTable) types.List {
+		value, diags := resource.radioTableToFramework(ctx, radios)
+		if diags.HasError() {
+			t.Fatalf("building radio table: %v", diags)
+		}
+		return value
+	}
+
+	actual := makeRadios([]unifi.DeviceRadioTable{
+		{Radio: "ng", Channel: "11", TxPower: "17", TxPowerMode: "auto"},
+	})
+
+	t.Run("preserves configured automatic values", func(t *testing.T) {
+		desired := makeRadios([]unifi.DeviceRadioTable{
+			{Radio: "ng", Channel: "auto", TxPowerMode: "auto"},
+		})
+		got, diags := reconcileAutomaticRadioSettings(ctx, desired, actual)
+		if diags.HasError() {
+			t.Fatalf("reconciling radio table: %v", diags)
+		}
+
+		var radios []radioTableModel
+		diags.Append(got.ElementsAs(ctx, &radios, false)...)
+		if diags.HasError() {
+			t.Fatalf("decoding radio table: %v", diags)
+		}
+		if radios[0].Channel.ValueString() != "auto" {
+			t.Errorf("channel = %q, want auto", radios[0].Channel.ValueString())
+		}
+		if radios[0].TxPower.ValueString() != "17" {
+			t.Errorf("tx_power = %q, want current value 17", radios[0].TxPower.ValueString())
+		}
+	})
+
+	t.Run("retains detectable manual drift", func(t *testing.T) {
+		desired := makeRadios([]unifi.DeviceRadioTable{
+			{Radio: "ng", Channel: "6"},
+		})
+		got, diags := reconcileAutomaticRadioSettings(ctx, desired, actual)
+		if diags.HasError() {
+			t.Fatalf("reconciling radio table: %v", diags)
+		}
+
+		var radios []radioTableModel
+		diags.Append(got.ElementsAs(ctx, &radios, false)...)
+		if diags.HasError() {
+			t.Fatalf("decoding radio table: %v", diags)
+		}
+		if radios[0].Channel.ValueString() != "11" {
+			t.Errorf("channel = %q, want controller value 11", radios[0].Channel.ValueString())
+		}
+	})
+}
+
 // TestMergePortOverridesByIndex guards #266: declaring a subset of port_override
 // blocks must not wipe the device's other ports. The UniFi PUT replaces the whole
 // port_overrides array, so the provider merges the declared ports (by port_idx)
@@ -835,37 +893,107 @@ func Test_mergePortOverridesByIndex(t *testing.T) {
 }
 
 func Test_deviceResource_reconcilePortOverrides(t *testing.T) {
-	type args struct {
-		ctx          context.Context
-		prior        types.Set
-		apiOverrides []unifi.DevicePortOverrides
+	ctx := context.Background()
+	profileID := "management-profile"
+	model := portOverrideModel{
+		Index:                     types.Int64Value(7),
+		Name:                      types.StringValue("Management 4"),
+		PortProfileID:             types.StringValue(profileID),
+		AggregateMembers:          types.ListNull(types.Int64Type),
+		ExcludedNetworkIDs:        types.SetNull(types.StringType),
+		MulticastRouterNetworkIDs: types.SetNull(types.StringType),
+		PortSecurityMACAddress:    types.ListNull(types.StringType),
+		TaggedNetworkIDs:          types.SetNull(types.StringType),
 	}
-	tests := []struct {
-		name  string
-		r     *deviceResource
-		args  args
-		want  types.Set
-		want1 diag.Diagnostics
-	}{}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, got1 := tt.r.reconcilePortOverrides(
-				tt.args.ctx,
-				tt.args.prior,
-				tt.args.apiOverrides,
+	object, diags := types.ObjectValueFrom(ctx, model.AttributeTypes(), model)
+	if diags.HasError() {
+		t.Fatalf("building port override: %v", diags)
+	}
+	prior, diags := types.SetValue(
+		types.ObjectType{AttrTypes: portOverrideAttrTypes()},
+		[]attr.Value{object},
+	)
+	if diags.HasError() {
+		t.Fatalf("building port override set: %v", diags)
+	}
+
+	t.Run("preserves profile omitted by gateway API", func(t *testing.T) {
+		got, gotDiags := (&deviceResource{}).reconcilePortOverrides(
+			ctx,
+			prior,
+			[]unifi.DevicePortOverrides{{
+				PortIDX:         ptrInt64(7),
+				Name:            "Management 4",
+				NATiveNetworkID: "management-network",
+			}},
+		)
+		if gotDiags.HasError() {
+			t.Fatalf("reconciling port override: %v", gotDiags)
+		}
+
+		var models []portOverrideModel
+		gotDiags.Append(got.ElementsAs(ctx, &models, false)...)
+		if gotDiags.HasError() {
+			t.Fatalf("decoding port override: %v", gotDiags)
+		}
+		if models[0].PortProfileID.ValueString() != profileID {
+			t.Errorf(
+				"port_profile_id = %q, want %q",
+				models[0].PortProfileID.ValueString(),
+				profileID,
 			)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("deviceResource.reconcilePortOverrides() got = %v, want %v", got, tt.want)
-			}
-			if !reflect.DeepEqual(got1, tt.want1) {
-				t.Errorf(
-					"deviceResource.reconcilePortOverrides() got1 = %v, want %v",
-					got1,
-					tt.want1,
-				)
-			}
-		})
-	}
+		}
+	})
+
+	t.Run("reports profile drift returned by API", func(t *testing.T) {
+		got, gotDiags := (&deviceResource{}).reconcilePortOverrides(
+			ctx,
+			prior,
+			[]unifi.DevicePortOverrides{{
+				PortIDX:       ptrInt64(7),
+				Name:          "Management 4",
+				PortProfileID: "different-profile",
+			}},
+		)
+		if gotDiags.HasError() {
+			t.Fatalf("reconciling port override: %v", gotDiags)
+		}
+
+		var models []portOverrideModel
+		gotDiags.Append(got.ElementsAs(ctx, &models, false)...)
+		if gotDiags.HasError() {
+			t.Fatalf("decoding port override: %v", gotDiags)
+		}
+		if models[0].PortProfileID.ValueString() != "different-profile" {
+			t.Errorf(
+				"port_profile_id = %q, want different-profile",
+				models[0].PortProfileID.ValueString(),
+			)
+		}
+	})
+
+	t.Run("reports removed profile", func(t *testing.T) {
+		got, gotDiags := (&deviceResource{}).reconcilePortOverrides(
+			ctx,
+			prior,
+			[]unifi.DevicePortOverrides{{
+				PortIDX: ptrInt64(7),
+				Name:    "Management 4",
+			}},
+		)
+		if gotDiags.HasError() {
+			t.Fatalf("reconciling port override: %v", gotDiags)
+		}
+
+		var models []portOverrideModel
+		gotDiags.Append(got.ElementsAs(ctx, &models, false)...)
+		if gotDiags.HasError() {
+			t.Fatalf("decoding port override: %v", gotDiags)
+		}
+		if !models[0].PortProfileID.IsNull() {
+			t.Errorf("port_profile_id = %q, want null", models[0].PortProfileID.ValueString())
+		}
+	})
 }
 
 func Test_deviceResource_portOverridesToFramework(t *testing.T) {
