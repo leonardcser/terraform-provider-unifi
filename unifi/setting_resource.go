@@ -236,8 +236,13 @@ type settingResourceModel struct {
 	Mgmt          types.Object   `tfsdk:"mgmt"`
 	Radius        types.Object   `tfsdk:"radius"`
 	USG           types.Object   `tfsdk:"usg"`
+	GlobalSwitch  types.Object   `tfsdk:"global_switch"`
 	IgmpSnooping  types.Object   `tfsdk:"igmp_snooping"`
 	Timeouts      timeouts.Value `tfsdk:"timeouts"`
+}
+
+type settingGlobalSwitchModel struct {
+	FlowControlEnabled types.Bool `tfsdk:"flow_control_enabled"`
 }
 
 // settingIgmpSnoopingModel is the nested igmp_snooping block. On UniFi 10.3.x the
@@ -369,6 +374,9 @@ var (
 		"suppression_alerts": types.ListType{
 			ElemType: types.ObjectType{AttrTypes: ipsAlertAttrTypes},
 		},
+	}
+	globalSwitchAttrTypes = map[string]attr.Type{
+		"flow_control_enabled": types.BoolType,
 	}
 	igmpSnoopingAttrTypes = map[string]attr.Type{
 		"enabled":     types.BoolType,
@@ -1253,6 +1261,16 @@ func (r *settingResource) Schema(
 					},
 				},
 			},
+			"global_switch": schema.SingleNestedAttribute{
+				MarkdownDescription: "Site-wide switch settings.",
+				Optional:            true,
+				Attributes: map[string]schema.Attribute{
+					"flow_control_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Enable IEEE 802.3x flow control across the local switched network.",
+						Required:            true,
+					},
+				},
+			},
 			"igmp_snooping": schema.SingleNestedAttribute{
 				MarkdownDescription: "Site-level IGMP snooping setting. On UniFi Network 10.3.x+ the effective IGMP snooping toggle lives here rather than on each network. Advanced querier/flood options configured in the UI are preserved across updates.",
 				Optional:            true,
@@ -1574,6 +1592,25 @@ func (r *settingResource) Create(
 		}
 	}
 
+	if !data.GlobalSwitch.IsNull() && !data.GlobalSwitch.IsUnknown() {
+		var globalSwitch settingGlobalSwitchModel
+		resp.Diagnostics.Append(data.GlobalSwitch.As(ctx, &globalSwitch, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading Global Switch Setting", err.Error())
+			return
+		}
+		setting.FlowctrlEnabled = globalSwitch.FlowControlEnabled.ValueBool()
+		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Creating Global Switch Setting", err.Error())
+			return
+		}
+	}
+
 	if !data.IgmpSnooping.IsNull() && !data.IgmpSnooping.IsUnknown() {
 		var igmp settingIgmpSnoopingModel
 		resp.Diagnostics.Append(data.IgmpSnooping.As(ctx, &igmp, basetypes.ObjectAsOptions{})...)
@@ -1861,6 +1898,25 @@ func (r *settingResource) Update(
 		setting := r.usgModelToSetting(ctx, &usg)
 		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
 			resp.Diagnostics.AddError("Error Updating USG Setting", err.Error())
+			return
+		}
+	}
+
+	if !plan.GlobalSwitch.IsNull() && !plan.GlobalSwitch.IsUnknown() {
+		var globalSwitch settingGlobalSwitchModel
+		resp.Diagnostics.Append(plan.GlobalSwitch.As(ctx, &globalSwitch, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+
+		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading Global Switch Setting", err.Error())
+			return
+		}
+		setting.FlowctrlEnabled = globalSwitch.FlowControlEnabled.ValueBool()
+		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+			resp.Diagnostics.AddError("Error Updating Global Switch Setting", err.Error())
 			return
 		}
 	}
@@ -2288,6 +2344,26 @@ func (r *settingResource) readSettings(
 			"upnp_secure_mode":                   types.BoolType,
 			"upnp_wan_interface":                 types.StringType,
 		})
+	}
+
+	// Global switch settings
+	if !data.GlobalSwitch.IsNull() && !data.GlobalSwitch.IsUnknown() {
+		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
+		if err != nil {
+			diags.AddError("Error Reading Global Switch Setting", err.Error())
+			return
+		}
+		model := settingGlobalSwitchModel{
+			FlowControlEnabled: types.BoolValue(setting.FlowctrlEnabled),
+		}
+		objValue, d := types.ObjectValueFrom(ctx, globalSwitchAttrTypes, model)
+		diags.Append(d...)
+		if diags.HasError() {
+			return
+		}
+		data.GlobalSwitch = objValue
+	} else {
+		data.GlobalSwitch = types.ObjectNull(globalSwitchAttrTypes)
 	}
 
 	// IGMP snooping (site-level)
