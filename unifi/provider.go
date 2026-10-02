@@ -41,7 +41,8 @@ type unifiProviderModel struct {
 // Client wraps the UniFi client with site information.
 type Client struct {
 	*ui.ApiClient
-	Site string
+	Site    string
+	console *consoleClient
 
 	// groupCache memoizes network members group name<->ID lookups per site. It lives
 	// on the shared *Client (one per provider configuration) rather than on the
@@ -82,7 +83,7 @@ func (p *unifiProvider) Schema(
 		Attributes: map[string]schema.Attribute{
 			"api_key": schema.StringAttribute{
 				MarkdownDescription: "API key for the Unifi controller. Can be specified with the `UNIFI_API_KEY` " +
-					"environment variable. If this is set, the `username` and `password` fields are ignored.",
+					"environment variable. If set, Network resources use the API key; OS and Protect resources still require a local username and password.",
 				Optional:  true,
 				Sensitive: true,
 			},
@@ -204,14 +205,9 @@ func (p *unifiProvider) Configure(
 	}
 
 	ctx = tflog.SetField(ctx, "unifi_api_url", apiUrl)
-	ctx = tflog.SetField(ctx, "unifi_api_key", apiKey)
-	ctx = tflog.SetField(ctx, "unifi_username", username)
-	ctx = tflog.SetField(ctx, "unifi_password", password)
 	ctx = tflog.SetField(ctx, "unifi_site", site)
 	ctx = tflog.SetField(ctx, "unifi_allow_insecure", allowInsecure)
 	ctx = tflog.SetField(ctx, "unifi_cloud_connector", cloudConnector)
-	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "unifi_api_key")
-	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "unifi_password")
 
 	tflog.Debug(ctx, "Creating Unifi client")
 
@@ -278,6 +274,7 @@ func (p *unifiProvider) Configure(
 	configuredClient := &Client{
 		ApiClient: client,
 		Site:      site,
+		console:   newConsoleClient(apiUrl, username, password, allowInsecure),
 	}
 
 	resp.DataSourceData = configuredClient
@@ -289,6 +286,8 @@ func (p *unifiProvider) Configure(
 
 func (p *unifiProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
+		NewOSApplicationResource,
+		NewProtectCameraResource,
 		NewRadiusUserResource,
 		NewDeprecatedAccountResource,
 		NewAPGroupResource,
