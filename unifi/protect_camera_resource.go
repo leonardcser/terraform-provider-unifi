@@ -33,6 +33,9 @@ type protectCamera struct {
 	RecordingSettings struct {
 		Mode string `json:"mode"`
 	} `json:"recordingSettings"`
+	LEDSettings struct {
+		IsEnabled bool `json:"isEnabled"`
+	} `json:"ledSettings"`
 }
 
 func normalizeProtectMAC(mac string) string {
@@ -58,7 +61,7 @@ func (c *consoleClient) camera(ctx context.Context, mac string) (*protectCamera,
 	return nil, nil
 }
 
-func (c *consoleClient) ensureCamera(ctx context.Context, mac, name, mode, bootstrapHost string) (*protectCamera, error) {
+func (c *consoleClient) ensureCamera(ctx context.Context, mac, name, mode, bootstrapHost string, statusLED *bool) (*protectCamera, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	camera, err := c.camera(ctx, mac)
@@ -112,9 +115,18 @@ func (c *consoleClient) ensureCamera(ctx context.Context, mac, name, mode, boots
 			return nil, err
 		}
 	}
-	if camera.Name != name || camera.RecordingSettings.Mode != mode {
-		err := c.request(ctx, http.MethodPatch, "/proxy/protect/api/cameras/"+url.PathEscape(camera.ID),
-			map[string]any{"name": name, "recordingSettings": map[string]any{"mode": mode}}, nil)
+	update := map[string]any{}
+	if camera.Name != name {
+		update["name"] = name
+	}
+	if camera.RecordingSettings.Mode != mode {
+		update["recordingSettings"] = map[string]any{"mode": mode}
+	}
+	if statusLED != nil && camera.LEDSettings.IsEnabled != *statusLED {
+		update["ledSettings"] = map[string]any{"isEnabled": *statusLED}
+	}
+	if len(update) > 0 {
+		err := c.request(ctx, http.MethodPatch, "/proxy/protect/api/cameras/"+url.PathEscape(camera.ID), update, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -122,7 +134,7 @@ func (c *consoleClient) ensureCamera(ctx context.Context, mac, name, mode, boots
 	err = waitConsole(ctx, 2*time.Second, func() (bool, error) {
 		var err error
 		camera, err = c.camera(ctx, mac)
-		return camera != nil && camera.Adopted && !camera.AdoptedByOther && camera.Name == name && camera.RecordingSettings.Mode == mode, err
+		return camera != nil && camera.Adopted && !camera.AdoptedByOther && camera.Name == name && camera.RecordingSettings.Mode == mode && (statusLED == nil || camera.LEDSettings.IsEnabled == *statusLED), err
 	})
 	return camera, err
 }
@@ -133,6 +145,7 @@ type protectCameraModel struct {
 	MAC              types.String `tfsdk:"mac"`
 	Name             types.String `tfsdk:"name"`
 	RecordingMode    types.String `tfsdk:"recording_mode"`
+	StatusLED        types.Bool   `tfsdk:"status_led"`
 	Host             types.String `tfsdk:"host"`
 	BootstrapHost    types.String `tfsdk:"bootstrap_host"`
 	UnadoptOnDestroy types.Bool   `tfsdk:"unadopt_on_destroy"`
@@ -150,6 +163,7 @@ func (r *protectCameraResource) Schema(_ context.Context, _ resource.SchemaReque
 			"mac":                schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.RegexMatches(regexp.MustCompile(`^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$`), "must be a colon-separated MAC address")}, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
 			"name":               schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.LengthAtLeast(1)}},
 			"recording_mode":     schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.OneOf("always", "detections", "never")}},
+			"status_led":         schema.BoolAttribute{Optional: true, Computed: true, MarkdownDescription: "Enable the camera status LED. When omitted, preserves the current setting. Does not control infrared illumination or other LED settings."},
 			"host":               schema.StringAttribute{Computed: true},
 			"bootstrap_host":     schema.StringAttribute{Optional: true, MarkdownDescription: "Initial camera IP for configuring its Protect server if discovery has not found it. Uses factory credentials or UNIFI_CAMERA_USERNAME and UNIFI_CAMERA_PASSWORD. Camera credentials are never retained in state."},
 			"unadopt_on_destroy": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false), MarkdownDescription: "Unadopt the camera on destroy; defaults to false to preserve surveillance."},
@@ -168,13 +182,19 @@ func (r *protectCameraResource) Configure(_ context.Context, req resource.Config
 	r.client = client.console
 }
 func (r *protectCameraResource) apply(ctx context.Context, model *protectCameraModel, diags *diag.Diagnostics) {
-	camera, err := r.client.ensureCamera(ctx, model.MAC.ValueString(), model.Name.ValueString(), model.RecordingMode.ValueString(), model.BootstrapHost.ValueString())
+	var statusLED *bool
+	if !model.StatusLED.IsNull() && !model.StatusLED.IsUnknown() {
+		value := model.StatusLED.ValueBool()
+		statusLED = &value
+	}
+	camera, err := r.client.ensureCamera(ctx, model.MAC.ValueString(), model.Name.ValueString(), model.RecordingMode.ValueString(), model.BootstrapHost.ValueString(), statusLED)
 	if err != nil {
 		diags.AddError("Error Managing Protect Camera", err.Error())
 		return
 	}
 	model.ID = types.StringValue(camera.ID)
 	model.Host = types.StringValue(camera.Host)
+	model.StatusLED = types.BoolValue(camera.LEDSettings.IsEnabled)
 }
 func (r *protectCameraResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var model protectCameraModel
@@ -221,6 +241,7 @@ func (r *protectCameraResource) Read(ctx context.Context, req resource.ReadReque
 	model.Name = types.StringValue(camera.Name)
 	model.RecordingMode = types.StringValue(camera.RecordingSettings.Mode)
 	model.Host = types.StringValue(camera.Host)
+	model.StatusLED = types.BoolValue(camera.LEDSettings.IsEnabled)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 }
 func (r *protectCameraResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

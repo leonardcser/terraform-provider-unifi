@@ -53,24 +53,84 @@ func TestProtectCameraAdoption(t *testing.T) {
 	}))
 	defer server.Close()
 	c := newConsoleClient(server.URL, "admin", "secret", false)
-	got, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5 Turret Ultra", "always", "")
+	got, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5 Turret Ultra", "always", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !got.Adopted || got.Name != "G5 Turret Ultra" || got.RecordingSettings.Mode != "always" {
 		t.Fatal("camera did not converge")
 	}
-	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5 Turret Ultra", "always", ""); err != nil {
+	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5 Turret Ultra", "always", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if adopts != 1 || patches != 1 {
 		t.Fatalf("not idempotent: adopts=%d patches=%d", adopts, patches)
 	}
-	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "Entrance", "detections", ""); err != nil {
+	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "Entrance", "detections", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if adopts != 1 || patches != 2 {
 		t.Fatal("update readopted camera")
+	}
+}
+
+func TestProtectCameraStatusLED(t *testing.T) {
+	camera := protectCamera{ID: "camera-1", MAC: "58D61FD1C8D4", Name: "G5", Adopted: true}
+	camera.RecordingSettings.Mode = "never"
+	camera.LEDSettings.IsEnabled = true
+	patches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/auth/login":
+			fmt.Fprint(w, `{}`)
+		case "/proxy/protect/api/bootstrap":
+			json.NewEncoder(w).Encode(map[string]any{"cameras": []protectCamera{camera}})
+		case "/proxy/protect/api/cameras/camera-1":
+			if r.Method != http.MethodPatch {
+				t.Error("wrong update method")
+			}
+			var update map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				t.Error(err)
+			}
+			var leds map[string]bool
+			if err := json.Unmarshal(update["ledSettings"], &leds); err != nil {
+				t.Error(err)
+			}
+			if len(update) != 1 || len(leds) != 1 {
+				t.Error("status LED update changed unrelated settings")
+			}
+			camera.LEDSettings.IsEnabled = leds["isEnabled"]
+			patches++
+			fmt.Fprint(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := newConsoleClient(server.URL, "admin", "secret", false)
+	for _, enabled := range []*bool{nil, new(bool), new(bool)} {
+		got, err := client.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "never", "", enabled)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if enabled == nil && !got.LEDSettings.IsEnabled {
+			t.Fatal("omitted status LED did not preserve the live setting")
+		}
+		if enabled != nil && got.LEDSettings.IsEnabled != *enabled {
+			t.Fatal("status LED did not converge")
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("status LED update is not idempotent: patches=%d", patches)
+	}
+	enabled := true
+	if _, err := client.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "never", "", &enabled); err != nil {
+		t.Fatal(err)
+	}
+	if !camera.LEDSettings.IsEnabled || patches != 2 {
+		t.Fatal("could not re-enable status LED")
 	}
 }
 
@@ -88,7 +148,7 @@ func TestProtectCameraRejectsForeignOwnership(t *testing.T) {
 	}))
 	defer server.Close()
 	c := newConsoleClient(server.URL, "admin", "secret", false)
-	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "always", ""); err == nil {
+	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "always", "", nil); err == nil {
 		t.Fatal("accepted foreign ownership")
 	}
 }
@@ -107,10 +167,10 @@ func TestProtectCameraRecordingWithoutStorage(t *testing.T) {
 	}))
 	defer server.Close()
 	c := newConsoleClient(server.URL, "admin", "secret", false)
-	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "always", ""); err == nil {
+	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "always", "", nil); err == nil {
 		t.Fatal("accepted recording without storage")
 	}
-	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "never", ""); err != nil {
+	if _, err := c.ensureCamera(context.Background(), "58:d6:1f:d1:c8:d4", "G5", "never", "", nil); err != nil {
 		t.Fatal(err)
 	}
 }

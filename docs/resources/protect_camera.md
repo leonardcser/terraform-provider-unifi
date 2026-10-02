@@ -31,6 +31,9 @@ resource "unifi_protect_camera" "entrance" {
   resource.
 - `name` (required string): camera display name.
 - `recording_mode` (required string): `always`, `detections`, or `never`.
+- `status_led` (optional boolean): enable or disable the camera status LED. When
+  omitted, preserves the current setting. Does not change infrared illumination
+  or other LED settings.
 - `bootstrap_host` (optional string): initial camera IP. If Protect has not found
   the camera, the provider logs into its setup API, verifies the MAC, and points
   it at the console. Uses public factory credentials unless both
