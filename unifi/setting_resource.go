@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -242,7 +243,50 @@ type settingResourceModel struct {
 }
 
 type settingGlobalSwitchModel struct {
-	FlowControlEnabled types.Bool `tfsdk:"flow_control_enabled"`
+	FlowControlEnabled          types.Bool `tfsdk:"flow_control_enabled"`
+	AutoStpEdgeDetectionEnabled types.Bool `tfsdk:"auto_stp_edge_detection_enabled"`
+}
+
+const globalSwitchSettingKey = "global_switch"
+
+// The go-unifi GlobalSwitch type does not model every controller field, so the
+// setting is read and written raw. Unmanaged fields round-trip unchanged.
+func getRawSetting(ctx context.Context, client *Client, site, key string) (*settings.RawSetting, error) {
+	all, err := client.ListSettings(ctx, site)
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Key == key {
+			return &all[i], nil
+		}
+	}
+	return nil, &ui.NotFoundError{}
+}
+
+func applyGlobalSwitchModel(data map[string]any, model settingGlobalSwitchModel) {
+	data["flowctrl_enabled"] = model.FlowControlEnabled.ValueBool()
+	if !model.AutoStpEdgeDetectionEnabled.IsNull() && !model.AutoStpEdgeDetectionEnabled.IsUnknown() {
+		data["auto_stp_edge_detection_enabled"] = model.AutoStpEdgeDetectionEnabled.ValueBool()
+	}
+}
+
+func globalSwitchModelFromData(data map[string]any) settingGlobalSwitchModel {
+	flowControl, _ := data["flowctrl_enabled"].(bool)
+	autoEdge, _ := data["auto_stp_edge_detection_enabled"].(bool)
+	return settingGlobalSwitchModel{
+		FlowControlEnabled:          types.BoolValue(flowControl),
+		AutoStpEdgeDetectionEnabled: types.BoolValue(autoEdge),
+	}
+}
+
+func writeGlobalSwitch(ctx context.Context, client *Client, site string, model settingGlobalSwitchModel) error {
+	setting, err := getRawSetting(ctx, client, site, globalSwitchSettingKey)
+	if err != nil {
+		return err
+	}
+	applyGlobalSwitchModel(setting.Data, model)
+	return client.UpdateSetting(ctx, site, setting)
 }
 
 // settingIgmpSnoopingModel is the nested igmp_snooping block. On UniFi 10.3.x the
@@ -376,7 +420,8 @@ var (
 		},
 	}
 	globalSwitchAttrTypes = map[string]attr.Type{
-		"flow_control_enabled": types.BoolType,
+		"flow_control_enabled":            types.BoolType,
+		"auto_stp_edge_detection_enabled": types.BoolType,
 	}
 	igmpSnoopingAttrTypes = map[string]attr.Type{
 		"enabled":     types.BoolType,
@@ -1269,6 +1314,14 @@ func (r *settingResource) Schema(
 						MarkdownDescription: "Enable IEEE 802.3x flow control across the local switched network.",
 						Required:            true,
 					},
+					"auto_stp_edge_detection_enabled": schema.BoolAttribute{
+						MarkdownDescription: "Let switch ports without spanning-tree neighbors become edge ports and forward immediately after link up. Ports that receive BPDUs keep normal spanning-tree behavior. Uses the current controller value when unset.",
+						Optional:            true,
+						Computed:            true,
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
 				},
 			},
 			"igmp_snooping": schema.SingleNestedAttribute{
@@ -1599,13 +1652,7 @@ func (r *settingResource) Create(
 			return
 		}
 
-		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
-		if err != nil {
-			resp.Diagnostics.AddError("Error Reading Global Switch Setting", err.Error())
-			return
-		}
-		setting.FlowctrlEnabled = globalSwitch.FlowControlEnabled.ValueBool()
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		if err := writeGlobalSwitch(ctx, r.client, site, globalSwitch); err != nil {
 			resp.Diagnostics.AddError("Error Creating Global Switch Setting", err.Error())
 			return
 		}
@@ -1909,13 +1956,7 @@ func (r *settingResource) Update(
 			return
 		}
 
-		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
-		if err != nil {
-			resp.Diagnostics.AddError("Error Reading Global Switch Setting", err.Error())
-			return
-		}
-		setting.FlowctrlEnabled = globalSwitch.FlowControlEnabled.ValueBool()
-		if err := r.client.UpdateSetting(ctx, site, setting); err != nil {
+		if err := writeGlobalSwitch(ctx, r.client, site, globalSwitch); err != nil {
 			resp.Diagnostics.AddError("Error Updating Global Switch Setting", err.Error())
 			return
 		}
@@ -2348,15 +2389,12 @@ func (r *settingResource) readSettings(
 
 	// Global switch settings
 	if !data.GlobalSwitch.IsNull() && !data.GlobalSwitch.IsUnknown() {
-		_, setting, err := ui.GetSetting[*settings.GlobalSwitch](r.client.ApiClient, ctx, site)
+		setting, err := getRawSetting(ctx, r.client, site, globalSwitchSettingKey)
 		if err != nil {
 			diags.AddError("Error Reading Global Switch Setting", err.Error())
 			return
 		}
-		model := settingGlobalSwitchModel{
-			FlowControlEnabled: types.BoolValue(setting.FlowctrlEnabled),
-		}
-		objValue, d := types.ObjectValueFrom(ctx, globalSwitchAttrTypes, model)
+		objValue, d := types.ObjectValueFrom(ctx, globalSwitchAttrTypes, globalSwitchModelFromData(setting.Data))
 		diags.Append(d...)
 		if diags.HasError() {
 			return
