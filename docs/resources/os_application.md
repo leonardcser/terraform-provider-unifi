@@ -1,15 +1,18 @@
 ---
 page_title: UniFi OS Application (Resource)
 description: |-
-  Installs and controls a UniFi OS application using a local admin session.
+  Installs and controls a UniFi OS application.
 ---
 
 # unifi_os_application (Resource)
 
-Installs a console application and manages whether it runs. Uses the private
-UniFi OS API, not the Network API. Supply a local admin login with the provider's
-`username`/`password` or `UNIFI_USERNAME`/`UNIFI_PASSWORD`, even when Network
-resources use `api_key`. Environment credentials are not stored in state.
+Installs a console application and manages whether it runs. Installing,
+starting and stopping use the private UniFi OS API and need a local admin login:
+the provider's `username`/`password` or `UNIFI_USERNAME`/`UNIFI_PASSWORD`.
+Without a login, `network` and `protect` are read through their integration APIs
+with `api_key`, so plans and applies that change nothing need no admin login. An
+application that does not answer reads as not running. Environment credentials
+are not stored in state.
 
 ```terraform
 resource "unifi_os_application" "protect" {

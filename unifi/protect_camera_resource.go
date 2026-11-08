@@ -139,6 +139,71 @@ func (c *consoleClient) ensureCamera(ctx context.Context, mac, name, mode, boots
 	return camera, err
 }
 
+// protectIntegrationCamera is the camera in the official Protect integration
+// API. It lists adopted cameras only and does not expose recording settings or
+// the camera address.
+type protectIntegrationCamera struct {
+	ID          string `json:"id"`
+	MAC         string `json:"mac"`
+	Name        string `json:"name"`
+	LEDSettings struct {
+		IsEnabled bool `json:"isEnabled"`
+	} `json:"ledSettings"`
+}
+
+const protectIntegrationCameras = "/proxy/protect/integration/v1/cameras"
+
+func (c *consoleClient) integrationCamera(ctx context.Context, mac string) (*protectIntegrationCamera, error) {
+	var cameras []protectIntegrationCamera
+	status, err := c.keyRequest(ctx, http.MethodGet, protectIntegrationCameras, nil, &cameras)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("Protect integration API returned HTTP %d; check that Protect is running", status)
+	}
+	for _, camera := range cameras {
+		if normalizeProtectMAC(camera.MAC) == normalizeProtectMAC(mac) {
+			return &camera, nil
+		}
+	}
+	return nil, nil
+}
+
+// updateIntegrationCamera sets the name and status LED of an adopted camera
+// with the API key.
+func (c *consoleClient) updateIntegrationCamera(ctx context.Context, mac, name string, statusLED *bool) (*protectIntegrationCamera, error) {
+	camera, err := c.integrationCamera(ctx, mac)
+	if err != nil {
+		return nil, err
+	}
+	if camera == nil {
+		return nil, fmt.Errorf("camera %s is not adopted; adoption requires local admin UNIFI_USERNAME and UNIFI_PASSWORD", mac)
+	}
+	update := map[string]any{}
+	if camera.Name != name {
+		update["name"] = name
+	}
+	if statusLED != nil && camera.LEDSettings.IsEnabled != *statusLED {
+		update["ledSettings"] = map[string]any{"isEnabled": *statusLED}
+	}
+	if len(update) == 0 {
+		return camera, nil
+	}
+	var updated protectIntegrationCamera
+	status, err := c.keyRequest(ctx, http.MethodPatch, protectIntegrationCameras+"/"+url.PathEscape(camera.ID), update, &updated)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("Protect integration API rejected the camera update with HTTP %d", status)
+	}
+	if updated.Name != name || (statusLED != nil && updated.LEDSettings.IsEnabled != *statusLED) {
+		return nil, fmt.Errorf("Protect did not apply the update to camera %s", mac)
+	}
+	return &updated, nil
+}
+
 type protectCameraResource struct{ client *consoleClient }
 type protectCameraModel struct {
 	ID               types.String `tfsdk:"id"`
@@ -157,7 +222,7 @@ func (r *protectCameraResource) Metadata(_ context.Context, req resource.Metadat
 }
 func (r *protectCameraResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Adopts a camera into UniFi Protect and manages its name and recording mode. Requires Protect installed and running, and local OS admin authentication. Never takes over cameras belonging to another console. Cameras remain adopted on destroy by default.",
+		MarkdownDescription: "Adopts a camera into UniFi Protect and manages its name, recording mode and status LED. Requires Protect installed and running. Adoption, recording mode changes and unadoption need a local admin session (`UNIFI_USERNAME` and `UNIFI_PASSWORD`). Without one, the provider reads and updates the name and status LED of an adopted camera through the Protect integration API with the API key; `recording_mode` and `host` then keep their last known values. Never takes over cameras belonging to another console. Cameras remain adopted on destroy by default.",
 		Attributes: map[string]schema.Attribute{
 			"id":                 schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 			"mac":                schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.RegexMatches(regexp.MustCompile(`^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$`), "must be a colon-separated MAC address")}, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
@@ -181,11 +246,28 @@ func (r *protectCameraResource) Configure(_ context.Context, req resource.Config
 	}
 	r.client = client.console
 }
-func (r *protectCameraResource) apply(ctx context.Context, model *protectCameraModel, diags *diag.Diagnostics) {
+
+// apply converges the camera. prior is the current state, or nil on create.
+func (r *protectCameraResource) apply(ctx context.Context, model, prior *protectCameraModel, diags *diag.Diagnostics) {
 	var statusLED *bool
 	if !model.StatusLED.IsNull() && !model.StatusLED.IsUnknown() {
 		value := model.StatusLED.ValueBool()
 		statusLED = &value
+	}
+	if !r.client.hasSession() {
+		if prior == nil || !prior.RecordingMode.Equal(model.RecordingMode) {
+			diags.AddError("Error Managing Protect Camera", "Adopting a camera or changing recording_mode requires local admin UNIFI_USERNAME and UNIFI_PASSWORD.")
+			return
+		}
+		camera, err := r.client.updateIntegrationCamera(ctx, model.MAC.ValueString(), model.Name.ValueString(), statusLED)
+		if err != nil {
+			diags.AddError("Error Managing Protect Camera", err.Error())
+			return
+		}
+		model.ID = types.StringValue(camera.ID)
+		model.Host = prior.Host
+		model.StatusLED = types.BoolValue(camera.LEDSettings.IsEnabled)
+		return
 	}
 	camera, err := r.client.ensureCamera(ctx, model.MAC.ValueString(), model.Name.ValueString(), model.RecordingMode.ValueString(), model.BootstrapHost.ValueString(), statusLED)
 	if err != nil {
@@ -202,18 +284,19 @@ func (r *protectCameraResource) Create(ctx context.Context, req resource.CreateR
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	r.apply(ctx, &model, &resp.Diagnostics)
+	r.apply(ctx, &model, nil, &resp.Diagnostics)
 	if !resp.Diagnostics.HasError() {
 		resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 	}
 }
 func (r *protectCameraResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var model protectCameraModel
+	var model, prior protectCameraModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &model)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	r.apply(ctx, &model, &resp.Diagnostics)
+	r.apply(ctx, &model, &prior, &resp.Diagnostics)
 	if !resp.Diagnostics.HasError() {
 		resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 	}
@@ -222,6 +305,22 @@ func (r *protectCameraResource) Read(ctx context.Context, req resource.ReadReque
 	var model protectCameraModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &model)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !r.client.hasSession() {
+		camera, err := r.client.integrationCamera(ctx, model.MAC.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading Protect Camera", err.Error())
+			return
+		}
+		if camera == nil {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		model.ID = types.StringValue(camera.ID)
+		model.Name = types.StringValue(camera.Name)
+		model.StatusLED = types.BoolValue(camera.LEDSettings.IsEnabled)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 		return
 	}
 	camera, err := r.client.camera(ctx, model.MAC.ValueString())

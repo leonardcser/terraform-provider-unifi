@@ -32,7 +32,7 @@ func (r *osApplicationResource) Metadata(_ context.Context, req resource.Metadat
 }
 func (r *osApplicationResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Installs and controls a UniFi OS application using a local admin session. By default removal from Terraform leaves the application and its data intact.",
+		MarkdownDescription: "Installs and controls a UniFi OS application. Installing, starting and stopping need a local admin session (`UNIFI_USERNAME` and `UNIFI_PASSWORD`). Without one, `network` and `protect` are read through their integration APIs with the API key, so plans and no-op applies need no admin login. By default removal from Terraform leaves the application and its data intact.",
 		Attributes: map[string]schema.Attribute{
 			"id":                   schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 			"name":                 schema.StringAttribute{Required: true, Validators: []validator.String{stringvalidator.OneOf("protect", "network", "access", "talk", "connect", "innerspace")}, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
@@ -54,7 +54,15 @@ func (r *osApplicationResource) Configure(_ context.Context, req resource.Config
 	r.client = client.console
 }
 func (r *osApplicationResource) apply(ctx context.Context, model *osApplicationModel, diags *diag.Diagnostics) {
-	app, err := r.client.ensureApplication(ctx, model.Name.ValueString(), model.Running.ValueBool())
+	name := model.Name.ValueString()
+	if !r.client.hasSession() && model.Running.ValueBool() {
+		if app, err := r.client.runningApplication(ctx, name); err == nil && app != nil {
+			model.ID = types.StringValue(app.Name)
+			model.Version = types.StringValue(app.Version)
+			return
+		}
+	}
+	app, err := r.client.ensureApplication(ctx, name, model.Running.ValueBool())
 	if err != nil {
 		diags.AddError("Error Managing UniFi OS Application", err.Error())
 		return
@@ -88,6 +96,21 @@ func (r *osApplicationResource) Read(ctx context.Context, req resource.ReadReque
 	var model osApplicationModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &model)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !r.client.hasSession() {
+		app, err := r.client.runningApplication(ctx, model.Name.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Error Reading UniFi OS Application", err.Error())
+			return
+		}
+		// Without a session a silent application is stopped or missing; either
+		// way it is not running, and applying needs the admin login.
+		model.Running = types.BoolValue(app != nil)
+		if app != nil {
+			model.Version = types.StringValue(app.Version)
+		}
+		resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)
 		return
 	}
 	app, err := r.client.application(ctx, model.Name.ValueString())

@@ -1,14 +1,18 @@
 ---
 page_title: UniFi Protect Camera (Resource)
 description: |-
-  Adopts a camera into UniFi Protect and manages its name and recording mode.
+  Adopts a camera into UniFi Protect and manages its name, recording mode and status LED.
 ---
 
 # unifi_protect_camera (Resource)
 
-Uses the private Protect API with a local OS administrator session. Supply the
-provider's `username`/`password` or `UNIFI_USERNAME`/`UNIFI_PASSWORD`; a Network API
-key is not sufficient. Protect must be installed and ready before provisioning.
+Adoption, `recording_mode` changes and unadoption use the private Protect API and
+need a local OS administrator login: the provider's `username`/`password` or
+`UNIFI_USERNAME`/`UNIFI_PASSWORD`. Without a login, the provider reads and
+updates the name and status LED of an adopted camera through the Protect
+integration API with `api_key`; `recording_mode` and `host` then keep their last
+known values, because that API does not expose them. Protect must be installed
+and ready before provisioning.
 
 ```terraform
 resource "unifi_protect_camera" "entrance" {

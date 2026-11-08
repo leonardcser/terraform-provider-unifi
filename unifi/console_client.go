@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-// consoleClient sends raw requests to a local console: UniFi OS and Protect
-// endpoints with a local OS session, and Network API fields that go-unifi does
-// not model with the API key when one is configured.
+// consoleClient sends raw requests to a local console. Application management
+// and the private Protect API need a local OS session. The Network API and the
+// official Protect integration API use the API key when one is configured.
 // Response bodies are never included in errors because they may contain credentials.
 type consoleClient struct {
 	baseURL       string
@@ -39,10 +39,15 @@ func newConsoleClient(baseURL, username, password string, insecure bool) *consol
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
+// hasSession reports whether local OS admin credentials are configured.
+func (c *consoleClient) hasSession() bool {
+	return c.username != "" && c.password != ""
+}
+
 func (c *consoleClient) request(ctx context.Context, method, endpoint string, payload, result any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.username == "" || c.password == "" {
+	if !c.hasSession() {
 		return fmt.Errorf("UniFi OS resources require a local admin username and password via provider configuration or UNIFI_USERNAME and UNIFI_PASSWORD")
 	}
 	for attempt := 0; attempt < 2; attempt++ {
@@ -89,9 +94,7 @@ func (c *consoleClient) network(ctx context.Context, method, site, endpoint stri
 			return err
 		}
 	} else {
-		c.mu.Lock()
-		status, err := c.send(ctx, method, endpoint, payload, &body)
-		c.mu.Unlock()
+		status, err := c.keyRequest(ctx, method, endpoint, payload, &body)
 		if err != nil {
 			return err
 		}
@@ -111,7 +114,22 @@ func (c *consoleClient) network(ctx context.Context, method, site, endpoint stri
 	return nil
 }
 
+// keyRequest sends a request authenticated with the API key and returns the
+// HTTP status. result is decoded only for successful responses.
+func (c *consoleClient) keyRequest(ctx context.Context, method, endpoint string, payload, result any) (int, error) {
+	if c.apiKey == "" {
+		return 0, fmt.Errorf("this operation requires the provider api_key or local admin UNIFI_USERNAME and UNIFI_PASSWORD")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sendWith(ctx, method, endpoint, payload, result, c.apiKey)
+}
+
 func (c *consoleClient) send(ctx context.Context, method, endpoint string, payload, result any) (int, error) {
+	return c.sendWith(ctx, method, endpoint, payload, result, "")
+}
+
+func (c *consoleClient) sendWith(ctx context.Context, method, endpoint string, payload, result any, apiKey string) (int, error) {
 	// Installation actions may block until package installation completes.
 	if !strings.HasPrefix(endpoint, "/api/controllers/") {
 		var cancel context.CancelFunc
@@ -137,8 +155,8 @@ func (c *consoleClient) send(ctx context.Context, method, endpoint string, paylo
 	if c.csrf != "" {
 		req.Header.Set("X-CSRF-Token", c.csrf)
 	}
-	if c.apiKey != "" && strings.HasPrefix(endpoint, "/proxy/network/") {
-		req.Header.Set("X-Api-Key", c.apiKey)
+	if apiKey != "" {
+		req.Header.Set("X-Api-Key", apiKey)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -183,6 +201,38 @@ func (c *consoleClient) application(ctx context.Context, name string) (*consoleA
 		}
 	}
 	return nil, fmt.Errorf("application %q is not supported by this UniFi OS console", name)
+}
+
+// applicationInfoEndpoints are official integration endpoints that answer with
+// the application version only while the application is installed and running.
+var applicationInfoEndpoints = map[string]string{
+	"network": "/proxy/network/integration/v1/info",
+	"protect": "/proxy/protect/integration/v1/meta/info",
+}
+
+// runningApplication reads an application through its integration API with the
+// API key. It returns nil when the application does not answer, because it is
+// stopped, not installed, or not ready yet.
+func (c *consoleClient) runningApplication(ctx context.Context, name string) (*consoleApplication, error) {
+	endpoint, ok := applicationInfoEndpoints[name]
+	if !ok {
+		return nil, fmt.Errorf("reading application %q requires local admin UNIFI_USERNAME and UNIFI_PASSWORD", name)
+	}
+	var info struct {
+		Version string `json:"applicationVersion"`
+	}
+	status, err := c.keyRequest(ctx, http.MethodGet, endpoint, nil, &info)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return nil, fmt.Errorf("UniFi OS rejected the API key for %s with HTTP %d", endpoint, status)
+	case status >= 200 && status < 300 && info.Version != "":
+		return &consoleApplication{Name: name, Installed: true, Running: true, Version: info.Version, ControllerStatus: "READY"}, nil
+	default:
+		return nil, nil
+	}
 }
 
 func (c *consoleClient) applicationAction(ctx context.Context, name, action string) error {
