@@ -78,6 +78,7 @@ resource "unifi_port_profile" "poe_disabled" {
 - `stormctrl_ucast_enabled` (Boolean) Enable unknown unicast Storm Control for the port profile.
 - `stormctrl_ucast_level` (Number) The unknown unicast Storm Control level for the port profile. Can be between 0 and 100.
 - `stormctrl_ucast_rate` (Number) The unknown unicast Storm Control rate for the port profile. Can be between 0 and 14880000.
+- `stp_edge_state` (String) Spanning-tree edge state for ports using the profile. `enabled` lets end-device ports forward right after link up; a port that receives BPDUs still falls back to normal spanning tree. Profiles without a value follow the site-wide automatic edge detection. The controller cannot clear a value once set. Valid values are `enabled` and `disabled`. Unset leaves the controller value unchanged.
 - `stp_port_mode` (Boolean) Enable Spanning Tree Protocol (STP) for the port profile. Computed from the controller when not set.
 - `tagged_networkconf_ids` (Set of String) The IDs of networks to tag traffic with for the port profile.
 - `tagged_vlan_mgmt` (String) How tagged VLANs are managed on the port. Can be `auto`, `block_all`, or `custom`.

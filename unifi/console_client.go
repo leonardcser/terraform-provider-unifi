@@ -15,12 +15,15 @@ import (
 	"time"
 )
 
-// consoleClient uses a local OS session independently of Network API-key authentication.
+// consoleClient sends raw requests to a local console: UniFi OS and Protect
+// endpoints with a local OS session, and Network API fields that go-unifi does
+// not model with the API key when one is configured.
 // Response bodies are never included in errors because they may contain credentials.
 type consoleClient struct {
 	baseURL       string
 	username      string
 	password      string
+	apiKey        string
 	http          *http.Client
 	mu            sync.Mutex
 	csrf          string
@@ -69,6 +72,45 @@ func (c *consoleClient) request(ctx context.Context, method, endpoint string, pa
 	return fmt.Errorf("UniFi OS session authentication failed")
 }
 
+// network sends a Network API request for site and decodes the response data
+// into result. It uses the API key when one is configured and the local OS
+// session otherwise.
+func (c *consoleClient) network(ctx context.Context, method, site, endpoint string, payload, result any) error {
+	endpoint = "/proxy/network/api/s/" + url.PathEscape(site) + endpoint
+	var body struct {
+		Meta struct {
+			RC  string `json:"rc"`
+			Msg string `json:"msg"`
+		} `json:"meta"`
+		Data json.RawMessage `json:"data"`
+	}
+	if c.apiKey == "" {
+		if err := c.request(ctx, method, endpoint, payload, &body); err != nil {
+			return err
+		}
+	} else {
+		c.mu.Lock()
+		status, err := c.send(ctx, method, endpoint, payload, &body)
+		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if status < 200 || status >= 300 {
+			return fmt.Errorf("UniFi Network %s %s returned HTTP %d", method, endpoint, status)
+		}
+	}
+	if body.Meta.RC != "ok" {
+		return fmt.Errorf("UniFi Network %s %s failed: %s", method, endpoint, body.Meta.Msg)
+	}
+	if result == nil {
+		return nil
+	}
+	if err := json.Unmarshal(body.Data, result); err != nil {
+		return fmt.Errorf("invalid data from UniFi Network %s", endpoint)
+	}
+	return nil
+}
+
 func (c *consoleClient) send(ctx context.Context, method, endpoint string, payload, result any) (int, error) {
 	// Installation actions may block until package installation completes.
 	if !strings.HasPrefix(endpoint, "/api/controllers/") {
@@ -94,6 +136,9 @@ func (c *consoleClient) send(ctx context.Context, method, endpoint string, paylo
 	}
 	if c.csrf != "" {
 		req.Header.Set("X-CSRF-Token", c.csrf)
+	}
+	if c.apiKey != "" && strings.HasPrefix(endpoint, "/proxy/network/") {
+		req.Header.Set("X-Api-Key", c.apiKey)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

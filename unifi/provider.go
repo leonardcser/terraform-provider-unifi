@@ -270,11 +270,16 @@ func (p *unifiProvider) Configure(
 		return
 	}
 
+	console := newConsoleClient(apiUrl, username, password, allowInsecure)
+	if !cloudConnector {
+		console.apiKey = apiKey
+	}
+
 	// Create wrapper client with site info
 	configuredClient := &Client{
 		ApiClient: client,
 		Site:      site,
-		console:   newConsoleClient(apiUrl, username, password, allowInsecure),
+		console:   console,
 	}
 
 	resp.DataSourceData = configuredClient

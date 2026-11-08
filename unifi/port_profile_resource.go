@@ -3,6 +3,8 @@ package unifi
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
@@ -104,6 +106,7 @@ type portProfileResourceModel struct {
 	StormctrlUcastLevel        types.Int64          `tfsdk:"stormctrl_ucast_level"`
 	StormctrlUcastRate         types.Int64          `tfsdk:"stormctrl_ucast_rate"`
 	STPPortMode                types.Bool           `tfsdk:"stp_port_mode"`
+	STPEdgeState               types.String         `tfsdk:"stp_edge_state"`
 	TaggedNetworkConfIDs       types.Set            `tfsdk:"tagged_networkconf_ids"`
 	VoiceNetworkConfID         types.String         `tfsdk:"voice_networkconf_id"`
 	ExcludedNetworkConfIDs     types.Set            `tfsdk:"excluded_networkconf_ids"`
@@ -409,6 +412,17 @@ func (r *portProfileResource) Schema(
 					boolplanmodifier.UseStateForUnknown(),
 				},
 			},
+			"stp_edge_state": schema.StringAttribute{
+				Description: "Spanning-tree edge state for ports using the profile. `enabled` lets end-device ports " +
+					"forward right after link up; a port that receives BPDUs still falls back to normal " +
+					"spanning tree. Profiles without a value follow the site-wide automatic edge detection. " +
+					"The controller cannot clear a value once set. Valid values are `enabled` and `disabled`. " +
+					"Unset leaves the controller value unchanged.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("enabled", "disabled"),
+				},
+			},
 			"tagged_networkconf_ids": schema.SetAttribute{
 				Description: "The IDs of networks to tag traffic with for the port profile.",
 				Optional:    true,
@@ -570,6 +584,14 @@ func (r *portProfileResource) Create(
 		return
 	}
 
+	if err := r.writeSTPEdgeState(ctx, site, apiPortProfile.ID, plan.STPEdgeState); err != nil {
+		resp.Diagnostics.AddError(
+			"Error Creating Port Profile",
+			fmt.Sprintf("Could not set STP edge state of port profile %s: %s", apiPortProfile.ID, err),
+		)
+		return
+	}
+
 	// Set state
 	plan.ID = types.StringValue(apiPortProfile.ID)
 	plan.Site = types.StringValue(site)
@@ -621,6 +643,18 @@ func (r *portProfileResource) Read(
 
 	// Update state from API response
 	resp.Diagnostics.Append(r.portProfileToModel(ctx, portProfile, &state, site)...)
+
+	if !state.STPEdgeState.IsNull() {
+		edge, err := r.readSTPEdgeState(ctx, site, id)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Error Reading Port Profile",
+				fmt.Sprintf("Could not read STP edge state of port profile %s: %s", id, err),
+			)
+			return
+		}
+		state.STPEdgeState = edge
+	}
 
 	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), state.ID)...)
 	diags = resp.State.Set(ctx, state)
@@ -696,9 +730,18 @@ func (r *portProfileResource) Update(
 		return
 	}
 
+	if err := r.writeSTPEdgeState(ctx, site, id, plan.STPEdgeState); err != nil {
+		resp.Diagnostics.AddError(
+			"Error Updating Port Profile",
+			fmt.Sprintf("Could not set STP edge state of port profile %s: %s", id, err),
+		)
+		return
+	}
+
 	// Update state from API response
 	resp.Diagnostics.Append(r.portProfileToModel(ctx, apiPortProfile, &state, site)...)
 
+	state.STPEdgeState = plan.STPEdgeState
 	state.Timeouts = plan.Timeouts
 
 	resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), state.ID)...)
@@ -1122,6 +1165,35 @@ func (r *portProfileResource) applyPlanToState(
 		state.STPPortMode = plan.STPPortMode
 	}
 	// Apply other fields as needed...
+}
+
+// portProfileSTPEdgeState is the stp_edge_state field, which go-unifi does not model.
+type portProfileSTPEdgeState struct {
+	STPEdgeState string `json:"stp_edge_state,omitempty"`
+}
+
+func (r *portProfileResource) readSTPEdgeState(ctx context.Context, site, id string) (types.String, error) {
+	var data []portProfileSTPEdgeState
+	if err := r.client.console.network(ctx, http.MethodGet, site, "/rest/portconf/"+url.PathEscape(id), nil, &data); err != nil {
+		return types.StringNull(), err
+	}
+	if len(data) != 1 {
+		return types.StringNull(), fmt.Errorf("port profile %s not found", id)
+	}
+	if data[0].STPEdgeState == "" {
+		return types.StringNull(), nil
+	}
+	return types.StringValue(data[0].STPEdgeState), nil
+}
+
+// writeSTPEdgeState sends only the edge state. The controller keeps fields that
+// a PUT omits, so the typed profile update leaves it in place and vice versa.
+func (r *portProfileResource) writeSTPEdgeState(ctx context.Context, site, id string, state types.String) error {
+	if state.IsNull() || state.IsUnknown() {
+		return nil
+	}
+	payload := portProfileSTPEdgeState{STPEdgeState: state.ValueString()}
+	return r.client.console.network(ctx, http.MethodPut, site, "/rest/portconf/"+url.PathEscape(id), payload, nil)
 }
 
 // ListResourceConfigSchema implements [list.ListResource].

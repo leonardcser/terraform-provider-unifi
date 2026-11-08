@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 func TestConsoleApplicationInstall(t *testing.T) {
@@ -114,6 +117,67 @@ func TestConsoleRejectsHTMLAndMissingCredentials(t *testing.T) {
 	c = newConsoleClient(server.URL, "", "", false)
 	if _, err := c.application(context.Background(), "protect"); err == nil {
 		t.Fatal("accepted missing OS credentials")
+	}
+}
+
+func TestConsoleNetworkUsesAPIKey(t *testing.T) {
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/auth/login" {
+			t.Error("API-key request opened an OS session")
+		}
+		if r.URL.Path != "/proxy/network/api/s/default/rest/portconf/abc" || r.Header.Get("X-Api-Key") != "key" {
+			t.Errorf("request %s %s without API key", r.Method, r.URL.Path)
+		}
+		if r.Method == http.MethodPut {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			if strings.Contains(string(b), "auto") {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"meta":{"rc":"error","msg":"api.err.InvalidPayload"},"data":[]}`)
+				return
+			}
+			fmt.Fprint(w, `{"meta":{"rc":"ok"},"data":[]}`)
+			return
+		}
+		fmt.Fprint(w, `{"meta":{"rc":"ok"},"data":[{"_id":"abc","stp_edge_state":"enabled"}]}`)
+	}))
+	defer server.Close()
+	c := newConsoleClient(server.URL, "", "", false)
+	c.apiKey = "key"
+	r := &portProfileResource{client: &Client{console: c}}
+	ctx := context.Background()
+
+	edge, err := r.readSTPEdgeState(ctx, "default", "abc")
+	if err != nil || edge.ValueString() != "enabled" {
+		t.Fatalf("read: %v %v", edge, err)
+	}
+	if err := r.writeSTPEdgeState(ctx, "default", "abc", types.StringValue("disabled")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.writeSTPEdgeState(ctx, "default", "abc", types.StringNull()); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 1 || bodies[0] != `{"stp_edge_state":"disabled"}` {
+		t.Fatalf("bodies: %v", bodies)
+	}
+	if err := r.writeSTPEdgeState(ctx, "default", "abc", types.StringValue("auto")); err == nil {
+		t.Fatal("accepted a rejected payload")
+	}
+}
+
+func TestConsoleNetworkRejectsErrorMeta(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"meta":{"rc":"error","msg":"api.err.NoSiteContext"},"data":[]}`)
+	}))
+	defer server.Close()
+	c := newConsoleClient(server.URL, "", "", false)
+	c.apiKey = "key"
+	err := c.network(context.Background(), http.MethodGet, "default", "/rest/portconf", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "api.err.NoSiteContext") {
+		t.Fatalf("error: %v", err)
 	}
 }
 
